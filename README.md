@@ -26,6 +26,20 @@ Default backend:
 python run_pdf_ocr2.py "/path/to/file.pdf" --output-dir ./outputs/run_vllm
 ```
 
+Persistent batch mode with one vLLM model load for the whole folder:
+
+```bash
+python run_pdf_ocr2.py "/path/to/pdf_folder" --output-dir ./outputs/batch_vllm
+```
+
+In directory mode, the vLLM backend loads once, then processes each PDF in the same Python process and writes one subfolder per document under the output directory.
+
+By default, directory mode submits pages in chunks of 4 per vLLM request batch so long documents show progress more steadily. Override that with:
+
+```bash
+python run_pdf_ocr2.py "/path/to/pdf_folder" --output-dir ./outputs/batch_vllm --pages-per-batch 6
+```
+
 Transformers fallback:
 
 ```bash
@@ -43,10 +57,10 @@ python run_pdf_ocr2_transformers.py "/path/to/file.pdf" --output-dir ./outputs/r
 
 The vLLM wrapper imports support modules from the nested upstream clone, currently under:
 
-- `DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/config.py`
-- `DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/deepseek_ocr2.py`
-- `DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/process/`
-- `DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/deepencoderv2/`
+- `DeepSeek-OCR2-master/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/config.py`
+- `DeepSeek-OCR2-master/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/deepseek_ocr2.py`
+- `DeepSeek-OCR2-master/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/process/`
+- `DeepSeek-OCR2-master/DeepSeek-OCR2-master/DeepSeek-OCR2-vllm/deepencoderv2/`
 
 If upstream changes break these imports, update the wrappers in this root repo rather than patching the nested clone.
 

@@ -16,10 +16,17 @@ from PIL import Image, ImageDraw, ImageFont
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run DeepSeek-OCR-2 vLLM PDF OCR from the local repo.")
-    parser.add_argument("pdf_path", help="Path to the input PDF.")
+    parser.add_argument("input_path", help="Path to an input PDF or a directory containing PDFs.")
     parser.add_argument("--output-dir", default="./outputs", help="Directory for OCR outputs.")
     parser.add_argument("--page-offset", type=int, default=0, help="0-based page offset to start from.")
     parser.add_argument("--max-pages", type=int, default=None, help="Maximum number of pages to process.")
+    parser.add_argument("--max-files", type=int, default=None, help="Maximum number of PDFs to process when input_path is a directory.")
+    parser.add_argument(
+        "--pages-per-batch",
+        type=int,
+        default=None,
+        help="Maximum pages to submit to vLLM at once for each PDF. Defaults to 4 in directory mode.",
+    )
     parser.add_argument("--dpi", type=int, default=144, help="Rasterization DPI for PDF pages.")
     parser.add_argument("--max-concurrency", type=int, default=None, help="Maximum number of concurrent page requests.")
     parser.add_argument("--num-workers", type=int, default=None, help="Image preprocessing worker count.")
@@ -148,12 +155,201 @@ def clean_content(content: str, page_index: int):
     return cleaned, matches_ref
 
 
+def discover_pdf_inputs(input_path: Path, max_files: int | None) -> list[Path]:
+    if input_path.is_file():
+        if input_path.suffix.lower() != ".pdf":
+            raise ValueError(f"Input file is not a PDF: {input_path}")
+        return [input_path]
+
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"Input path does not exist: {input_path}")
+
+    pdf_paths = sorted(
+        [path for path in input_path.iterdir() if path.is_file() and path.suffix.lower() == ".pdf"],
+        key=lambda path: path.name.lower(),
+    )
+    if max_files is not None:
+        pdf_paths = pdf_paths[:max_files]
+    if not pdf_paths:
+        raise FileNotFoundError(f"No PDFs found in directory: {input_path}")
+    return pdf_paths
+
+
+def selected_page_count(pdf_path: Path, page_offset: int, max_pages: int | None) -> int:
+    with fitz.open(pdf_path) as document:
+        total_pages = document.page_count
+    page_start = max(page_offset, 0)
+    page_end = total_pages if max_pages is None else min(total_pages, page_start + max_pages)
+    return max(0, page_end - page_start)
+
+
+def build_output_dirs(pdf_paths: list[Path], base_output_dir: Path) -> dict[Path, Path]:
+    if len(pdf_paths) == 1:
+        return {pdf_paths[0]: base_output_dir}
+
+    output_dirs: dict[Path, Path] = {}
+    used_names: dict[str, int] = {}
+    for pdf_path in pdf_paths:
+        output_name = pdf_path.stem
+        duplicate_count = used_names.get(output_name, 0)
+        used_names[output_name] = duplicate_count + 1
+        if duplicate_count:
+            output_name = f"{output_name}_{duplicate_count + 1}"
+        output_dirs[pdf_path] = base_output_dir / output_name
+    return output_dirs
+
+
+def resolve_pages_per_batch(pdf_paths: list[Path], requested: int | None) -> int | None:
+    if requested is not None:
+        return max(1, requested)
+    if len(pdf_paths) > 1:
+        return 4
+    return None
+
+
+def resolve_vllm_support_dir(repo_root: Path) -> Path:
+    candidates = [
+        repo_root / "DeepSeek-OCR2-master" / "DeepSeek-OCR2-vllm",
+        repo_root / "DeepSeek-OCR2-master" / "DeepSeek-OCR2-master" / "DeepSeek-OCR2-vllm",
+    ]
+    for candidate in candidates:
+        if (candidate / "config.py").exists():
+            return candidate
+    raise FileNotFoundError(
+        "Could not locate DeepSeek-OCR-2 vLLM support modules under the nested upstream clone."
+    )
+
+
+def build_request_payloads(images, processor, crop_mode, prompt: str, num_workers: int):
+    def process_single_image(image_tuple):
+        page_num, image, _path = image_tuple
+        return page_num, {
+            "prompt": prompt,
+            "multi_modal_data": {
+                "image": processor.tokenize_with_images(images=[image], bos=True, eos=True, cropping=crop_mode),
+            },
+        }
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        batch_inputs = list(executor.map(process_single_image, images))
+    batch_inputs.sort(key=lambda item: item[0])
+    return [item[1] for item in batch_inputs]
+
+
+def process_pdf(pdf_path: Path, output_dir: Path, runtime: dict, args, start_time: float) -> None:
+    pages_dir = output_dir / "pages"
+    page_outputs_dir = output_dir / "page_outputs"
+    images_dir = output_dir / "images"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    page_outputs_dir.mkdir(parents=True, exist_ok=True)
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    log(start_time, f"[{pdf_path.name}] PDF path: {pdf_path}")
+
+    doc = fitz.open(pdf_path)
+    total_pages = doc.page_count
+    page_start = max(args.page_offset, 0)
+    page_end = total_pages if args.max_pages is None else min(total_pages, page_start + args.max_pages)
+    selected_pages = list(range(page_start, page_end))
+    log(start_time, f"[{pdf_path.name}] Opened PDF with {total_pages} pages; processing pages {page_start + 1}..{page_end}")
+
+    images = []
+    render_started = time.time()
+    for page_index in selected_pages:
+        page_num = page_index + 1
+        log(start_time, f"[{pdf_path.name}] Rendering page {page_num}/{total_pages}")
+        image = render_page(doc[page_index], args.dpi)
+        page_image_path = pages_dir / f"page_{page_num:03d}.png"
+        image.save(page_image_path)
+        images.append((page_num, image, page_image_path))
+    doc.close()
+    log(start_time, f"[{pdf_path.name}] Rendered {len(images)} pages in {time.time() - render_started:.1f}s")
+
+    combined_cleaned = []
+    combined_detailed = []
+    layout_images = []
+    page_batch_size = runtime["pages_per_batch"] or len(images)
+    total_batches = (len(images) + page_batch_size - 1) // page_batch_size
+    num_workers = args.num_workers or min(32, max(1, page_batch_size))
+
+    for batch_start in range(0, len(images), page_batch_size):
+        batch_images = images[batch_start: batch_start + page_batch_size]
+        batch_number = (batch_start // page_batch_size) + 1
+
+        preprocess_started = time.time()
+        request_payloads = build_request_payloads(
+            batch_images,
+            runtime["processor"],
+            runtime["crop_mode"],
+            runtime["prompt"],
+            num_workers,
+        )
+        log(
+            start_time,
+            f"[{pdf_path.name}] Prepared chunk {batch_number}/{total_batches} with {len(request_payloads)} page request(s) in {time.time() - preprocess_started:.1f}s",
+        )
+
+        generate_started = time.time()
+        outputs_list = runtime["llm"].generate(request_payloads, sampling_params=runtime["sampling_params"])
+        log(
+            start_time,
+            f"[{pdf_path.name}] Generated chunk {batch_number}/{total_batches} in {time.time() - generate_started:.1f}s",
+        )
+
+        for (page_num, image, _page_image_path), output in zip(batch_images, outputs_list):
+            page_output_dir = page_outputs_dir / f"page_{page_num:03d}"
+            page_output_dir.mkdir(parents=True, exist_ok=True)
+
+            raw_text = output.outputs[0].text
+            raw_text = raw_text.replace("<｜end▁of▁sentence｜>", "")
+            (page_output_dir / "result_det.mmd").write_text(raw_text, encoding="utf-8")
+
+            cleaned_text, matches_ref = clean_content(raw_text, page_num - 1)
+            (page_output_dir / "result.mmd").write_text(cleaned_text, encoding="utf-8")
+
+            layout_image = draw_bounding_boxes(image, matches_ref, images_dir, page_num - 1)
+            layout_image_path = page_output_dir / "result_with_boxes.jpg"
+            layout_image.save(layout_image_path)
+            layout_images.append(layout_image)
+
+            combined_detailed.append(raw_text)
+            combined_cleaned.append(cleaned_text)
+            log(start_time, f"[{pdf_path.name}] Completed page {page_num}/{total_pages}; chars={len(cleaned_text)}")
+
+    combined_separator = "\n\n<--- Page Split --->\n\n"
+    combined_mmd = output_dir / f"{pdf_path.stem}_combined.mmd"
+    combined_md = output_dir / f"{pdf_path.stem}_combined.md"
+    combined_det = output_dir / f"{pdf_path.stem}_combined_det.mmd"
+    layouts_pdf = output_dir / f"{pdf_path.stem}_layouts.pdf"
+
+    combined_mmd.write_text(combined_separator.join(combined_cleaned), encoding="utf-8")
+    combined_md.write_text(combined_separator.join(combined_cleaned), encoding="utf-8")
+    combined_det.write_text(combined_separator.join(combined_detailed), encoding="utf-8")
+    pil_to_pdf_img2pdf(layout_images, layouts_pdf)
+    log(start_time, f"[{pdf_path.name}] Wrote combined outputs to {combined_mmd} and {combined_md}")
+    log(start_time, f"[{pdf_path.name}] Run complete")
+
+
 def main() -> int:
     args = build_argument_parser().parse_args()
     start_time = time.time()
 
+    input_path = Path(args.input_path).expanduser()
+    pdf_paths = discover_pdf_inputs(input_path, args.max_files)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dirs = build_output_dirs(pdf_paths, output_dir)
+    pages_per_batch = resolve_pages_per_batch(pdf_paths, args.pages_per_batch)
+
+    max_num_seqs = args.max_concurrency
+    if max_num_seqs is None:
+        if pages_per_batch is not None:
+            max_num_seqs = pages_per_batch
+        else:
+            max_num_seqs = max(selected_page_count(pdf_path, args.page_offset, args.max_pages) for pdf_path in pdf_paths)
+        max_num_seqs = max(1, max_num_seqs)
+
     repo_root = Path(__file__).resolve().parent
-    vllm_dir = repo_root / "DeepSeek-OCR2-master" / "DeepSeek-OCR2-vllm"
+    vllm_dir = resolve_vllm_support_dir(repo_root)
     sys.path.insert(0, str(vllm_dir))
 
     if torch.version.cuda == "11.8":
@@ -171,44 +367,15 @@ def main() -> int:
     logging.getLogger("vllm").setLevel(logging.WARNING)
     ModelRegistry.register_model("DeepseekOCR2ForCausalLM", DeepseekOCR2ForCausalLM)
 
-    pdf_path = Path(args.pdf_path).expanduser()
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    pages_dir = output_dir / "pages"
-    page_outputs_dir = output_dir / "page_outputs"
-    images_dir = output_dir / "images"
-    pages_dir.mkdir(parents=True, exist_ok=True)
-    page_outputs_dir.mkdir(parents=True, exist_ok=True)
-    images_dir.mkdir(parents=True, exist_ok=True)
-
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
     local_files_only = not args.allow_network
     if local_files_only:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-    log(start_time, f"PDF path: {pdf_path}")
+    log(start_time, f"Discovered {len(pdf_paths)} PDF(s) from {input_path}")
+    if pages_per_batch is not None:
+        log(start_time, f"Using chunked vLLM page batches of {pages_per_batch}")
     log(start_time, f"Torch: {torch.__version__}, CUDA available={torch.cuda.is_available()}, device_count={torch.cuda.device_count()}")
-
-    doc = fitz.open(pdf_path)
-    total_pages = doc.page_count
-    page_start = max(args.page_offset, 0)
-    page_end = total_pages if args.max_pages is None else min(total_pages, page_start + args.max_pages)
-    selected_pages = list(range(page_start, page_end))
-    log(start_time, f"Opened PDF with {total_pages} pages; processing pages {page_start + 1}..{page_end}")
-
-    images = []
-    render_started = time.time()
-    for page_index in selected_pages:
-        page_num = page_index + 1
-        log(start_time, f"Rendering page {page_num}/{total_pages}")
-        image = render_page(doc[page_index], args.dpi)
-        page_image_path = pages_dir / f"page_{page_num:03d}.png"
-        image.save(page_image_path)
-        images.append((page_num, image, page_image_path))
-    doc.close()
-    log(start_time, f"Rendered {len(images)} pages in {time.time() - render_started:.1f}s")
 
     load_started = time.time()
     llm = LLM(
@@ -219,7 +386,7 @@ def main() -> int:
         trust_remote_code=True,
         max_model_len=8192,
         swap_space=0,
-        max_num_seqs=args.max_concurrency or max(1, len(images)),
+        max_num_seqs=max_num_seqs,
         tensor_parallel_size=1,
         gpu_memory_utilization=args.gpu_memory_utilization,
         disable_mm_preprocessor_cache=True,
@@ -228,23 +395,6 @@ def main() -> int:
 
     processor = DeepseekOCR2Processor(tokenizer=TOKENIZER)
     prompt = "<image>\n<|grounding|>Convert the document to markdown."
-    num_workers = args.num_workers or min(32, max(1, len(images)))
-    preprocess_started = time.time()
-
-    def process_single_image(image_tuple):
-        page_num, image, _path = image_tuple
-        return page_num, {
-            "prompt": prompt,
-            "multi_modal_data": {
-                "image": processor.tokenize_with_images(images=[image], bos=True, eos=True, cropping=CROP_MODE),
-            },
-        }
-
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        batch_inputs = list(executor.map(process_single_image, images))
-    batch_inputs.sort(key=lambda item: item[0])
-    request_payloads = [item[1] for item in batch_inputs]
-    log(start_time, f"Prepared {len(request_payloads)} page requests in {time.time() - preprocess_started:.1f}s")
 
     logits_processors = [
         NoRepeatNGramLogitsProcessor(ngram_size=20, window_size=50, whitelist_token_ids={128821, 128822})
@@ -257,45 +407,19 @@ def main() -> int:
         include_stop_str_in_output=True,
     )
 
-    generate_started = time.time()
-    outputs_list = llm.generate(request_payloads, sampling_params=sampling_params)
-    log(start_time, f"Generated {len(outputs_list)} page outputs in {time.time() - generate_started:.1f}s")
+    runtime = {
+        "llm": llm,
+        "processor": processor,
+        "sampling_params": sampling_params,
+        "prompt": prompt,
+        "crop_mode": CROP_MODE,
+        "pages_per_batch": pages_per_batch,
+    }
 
-    combined_cleaned = []
-    combined_detailed = []
-    layout_images = []
-    for (page_num, image, _page_image_path), output in zip(images, outputs_list):
-        page_output_dir = page_outputs_dir / f"page_{page_num:03d}"
-        page_output_dir.mkdir(parents=True, exist_ok=True)
+    for pdf_path in pdf_paths:
+        process_pdf(pdf_path, output_dirs[pdf_path], runtime, args, start_time)
 
-        raw_text = output.outputs[0].text
-        raw_text = raw_text.replace("<｜end▁of▁sentence｜>", "")
-        (page_output_dir / "result_det.mmd").write_text(raw_text, encoding="utf-8")
-
-        cleaned_text, matches_ref = clean_content(raw_text, page_num - 1)
-        (page_output_dir / "result.mmd").write_text(cleaned_text, encoding="utf-8")
-
-        layout_image = draw_bounding_boxes(image, matches_ref, images_dir, page_num - 1)
-        layout_image_path = page_output_dir / "result_with_boxes.jpg"
-        layout_image.save(layout_image_path)
-        layout_images.append(layout_image)
-
-        combined_detailed.append(raw_text)
-        combined_cleaned.append(cleaned_text)
-        log(start_time, f"Completed page {page_num}/{total_pages}; chars={len(cleaned_text)}")
-
-    combined_separator = "\n\n<--- Page Split --->\n\n"
-    combined_mmd = output_dir / f"{pdf_path.stem}_combined.mmd"
-    combined_md = output_dir / f"{pdf_path.stem}_combined.md"
-    combined_det = output_dir / f"{pdf_path.stem}_combined_det.mmd"
-    layouts_pdf = output_dir / f"{pdf_path.stem}_layouts.pdf"
-
-    combined_mmd.write_text(combined_separator.join(combined_cleaned), encoding="utf-8")
-    combined_md.write_text(combined_separator.join(combined_cleaned), encoding="utf-8")
-    combined_det.write_text(combined_separator.join(combined_detailed), encoding="utf-8")
-    pil_to_pdf_img2pdf(layout_images, layouts_pdf)
-    log(start_time, f"Wrote combined outputs to {combined_mmd} and {combined_md}")
-    log(start_time, "Run complete")
+    log(start_time, f"Batch complete; processed {len(pdf_paths)} PDF(s)")
     return 0
 
 
