@@ -1,0 +1,9 @@
+DeepSeek-OCR2-master/
+outputs/
+__pycache__/
+*.pyc
+*.pyo
+
+# temporary migration artifacts
+.git.upstream-root-backup/
+DeepSeek-OCR2-master.pre-separation-backup/
